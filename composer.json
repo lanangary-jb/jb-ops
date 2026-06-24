@@ -1,0 +1,9 @@
+{
+    "name": "lanangary-jb/jb-ops",
+    "description": "JB Ops Bridge — secured, token-gated WordPress ops REST endpoint (must-use plugin).",
+    "type": "wordpress-muplugin",
+    "license": "proprietary",
+    "require": {
+        "composer/installers": "^1.0 || ^2.0"
+    }
+}
