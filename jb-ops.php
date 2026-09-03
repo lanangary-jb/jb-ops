@@ -3804,6 +3804,19 @@ class H_Ops_Bridge {
 			rocket_clean_domain();
 			$done['wp_rocket'] = true;
 		}
+		// LiteSpeed (the default on Hostinger). Without this the op still returns
+		// ok:true while the page cache keeps serving pre-deploy HTML — and LSCache
+		// pins entries for days, so a stale robots.txt or template survives long
+		// past the deploy that was supposed to replace it.
+		if ( has_action( 'litespeed_purge_all' ) ) {
+			do_action( 'litespeed_purge_all' );
+			$done['litespeed'] = true;
+		}
+		// Cloudflare / other proxies that honour a WP-side purge hook.
+		if ( has_action( 'cloudflare_purge_everything' ) ) {
+			do_action( 'cloudflare_purge_everything' );
+			$done['cloudflare'] = true;
+		}
 		return array( 'cleared' => $done );
 	}
 

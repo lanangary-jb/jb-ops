@@ -1,0 +1,3 @@
+# Local-only internal notes — must NEVER be committed/pushed (this is a PUBLIC repo).
+AI-SETUP.md
+*.local.md
