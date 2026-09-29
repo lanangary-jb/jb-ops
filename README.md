@@ -6,7 +6,8 @@ Intended for trusted, first-party site-management automation.
 
 ## Security posture
 
-- **No anonymous access.** Every request requires a valid bearer credential.
+- **No anonymous access.** Every request requires a valid bearer credential. The one exception is
+  the sign-in route below, which carries its own signed, single-use token instead.
 - **Signed access tokens.** When an Ed25519 public key is configured (`H_OPS_SIGNING_PUBKEY`), the
   bridge accepts only short-lived, **daily-rotating** tokens signed by the matching private key. A
   public key can *verify* a token but never *forge* one, so it is safe to ship; the private key is
@@ -20,11 +21,20 @@ Intended for trusted, first-party site-management automation.
 - **Audited.** Every call is recorded to an audit table.
 - **Admin UI lockdown.** Settings/activity pages are visible only to logged-in administrators on
   allowed email domains (filterable via `jb_ops_allowed_email_domains`).
+- **Sign in from Loop.** `POST wp-json/h-ops/v1/sso` (form field `assertion`) takes a token signed
+  by Loop, valid for at most 60 seconds, and logs that person into wp-admin. It is separate from the
+  bearer-token bridge and stays off until `H_OPS_SSO_PUBKEYS` holds a key. Each token works once,
+  and attempts are audited. Roles are limited to administrator and editor
+  (`jb_ops_sso_allowed_roles`). New accounts are only created for staff email domains
+  (`jb_ops_sso_jit_email_domains`), and those accounts can't sign in with a password, reset one, or
+  use application passwords. It can be disabled per site in Settings.
 
 ## Configuration
 
 - `H_OPS_SIGNING_PUBKEY` — base64 Ed25519 public key for the signed-token path. Leave empty (`''`)
   to disable it and use the manual enable + per-site token model in **wp-admin → JB Ops → Settings**.
+- `H_OPS_SSO_PUBKEYS`: array of base64 Ed25519 public keys that Loop's sign-in tokens are checked
+  against (a list, so a key can be rotated). Empty by default, which keeps sign-in from Loop off.
 - The endpoint is namespaced under `wp-json/h-ops/v1/` and exposes a self-describing operation list
   to authenticated clients.
 

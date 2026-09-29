@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Ops Bridge
  * Description: JuiceBox Ops Bridge — a secured, structured REST endpoint for AI-assisted site/DB inspection and controlled changes. Reads and writes are allowlisted ops; writes are dry-run by default and need a confirm_token to apply, and each applied write returns a revert_token. The wp-admin UI is visible only to JuiceBox staff (logged-in admins on a juicebox.co.id / juicebox.com.au email).
- * Version: 0.9.2
+ * Version: 0.12.0
  * Author: JuiceBox
  *
  * SECURITY MODEL
@@ -29,6 +29,10 @@
  *    (juicebox.co.id / juicebox.com.au; filterable via 'jb_ops_allowed_email_domains').
  *    Everyone else sees no menu. The REST bridge is unaffected — it authenticates by
  *    token and has no logged-in user.
+ *  - SIGN IN FROM LOOP (POST /sso) is separate from the bridge token and never reaches /run:
+ *    a single-use, <=60s Ed25519 token signed by Loop (keys in H_OPS_SSO_PUBKEYS; off while
+ *    that list is empty) logs a staff member into wp-admin. Accounts it creates are marked
+ *    managed and can never sign in with a password, reset one, or use application passwords.
  *
  * CONFIG
  *  All settings live in the plugin — no wp-config / .env changes.
@@ -42,7 +46,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'H_OPS_VERSION', '0.11.0' );
+// Two copies can be on disk at once (e.g. a flat mu-plugin plus a Composer-installed one). WordPress
+// includes both and the second class declaration would fatal the site, so the later copy bows out.
+if ( defined( 'H_OPS_VERSION' ) ) {
+	return;
+}
+
+define( 'H_OPS_VERSION', '0.12.0' );
 define( 'H_OPS_NS', 'h-ops/v1' );
 
 /**
@@ -58,6 +68,15 @@ if ( ! defined( 'H_OPS_SIGNING_PUBKEY' ) ) {
 }
 /** Context string mixed into the signed message, so the key can't be cross-used for another purpose. */
 define( 'H_OPS_SIGN_CONTEXT', 'h-ops-v1:' );
+
+/**
+ * Ed25519 PUBLIC keys (standard base64, a list so a key can be rotated) for "Sign in from Loop".
+ * Like the key above, a public key can only VERIFY Loop's sign-in token, never mint one. Empty =
+ * sign-in from Loop is off on this site; define the list before this file loads to turn it on.
+ */
+if ( ! defined( 'H_OPS_SSO_PUBKEYS' ) ) {
+	define( 'H_OPS_SSO_PUBKEYS', array() );
+}
 
 class H_Ops_Bridge {
 
@@ -77,12 +96,23 @@ class H_Ops_Bridge {
 	const EXPORT_TTL   = 3600;   // 1 hour
 	/** Rows read+written per chunk while dumping a table (streamed, never all in memory at once). */
 	const EXPORT_BATCH = 2000;
+	/** Sign in from Loop: jb2 signature context, max token lifetime and clock skew (seconds). */
+	const SSO_CONTEXT = 'h-ops-sso-v1:';
+	const SSO_MAX_TTL = 60;
+	const SSO_SKEW    = 60;
+	/** User meta: the Loop user id an account is linked to, and the flag for accounts SSO created. */
+	const SSO_SUB_META     = 'jb_loop_user_id';
+	const SSO_MANAGED_META = 'jb_loop_managed';
 
 	public function __construct() {
 		$this->register_ops();
 		add_action( 'rest_api_init', array( $this, 'register_routes' ) );
 		// In-place version upgrades (file deploy, not (re)activation) still get the tables.
 		add_action( 'plugins_loaded', array( $this, 'maybe_upgrade' ) );
+		// Managed (SSO-created) accounts must stay Loop-only on every request type, not just in wp-admin.
+		add_filter( 'authenticate', array( $this, 'sso_block_password_login' ), 99 );
+		add_filter( 'allow_password_reset', array( $this, 'sso_block_password_reset' ), 10, 2 );
+		add_filter( 'wp_is_application_passwords_available_for_user', array( $this, 'sso_block_app_passwords' ), 10, 2 );
 		if ( is_admin() ) {
 			add_action( 'admin_menu', array( $this, 'admin_menu' ) );
 			add_action( 'admin_post_h_ops_save', array( $this, 'handle_admin_save' ) );
@@ -172,15 +202,23 @@ class H_Ops_Bridge {
 		if ( ! $user || ! $user->exists() ) {
 			return false;
 		}
-		$email = strtolower( trim( (string) $user->user_email ) );
+		return $this->email_domain_allowed( $user->user_email, $this->jb_email_domains() );
+	}
+
+	/** The JuiceBox staff email domains (filterable via jb_ops_allowed_email_domains). */
+	private function jb_email_domains() {
+		$allowed = apply_filters( 'jb_ops_allowed_email_domains', array( 'juicebox.co.id', 'juicebox.com.au' ) );
+		return array_map( 'strtolower', array_filter( (array) $allowed ) );
+	}
+
+	/** Exact match on everything after the last "@", so subdomains and look-alike suffixes never pass. */
+	private function email_domain_allowed( $email, $domains ) {
+		$email = strtolower( trim( (string) $email ) );
 		$at    = strrpos( $email, '@' );
 		if ( false === $at ) {
 			return false;
 		}
-		$domain  = substr( $email, $at + 1 );
-		$allowed = apply_filters( 'jb_ops_allowed_email_domains', array( 'juicebox.co.id', 'juicebox.com.au' ) );
-		$allowed = array_map( 'strtolower', array_filter( (array) $allowed ) );
-		return in_array( $domain, $allowed, true );
+		return in_array( substr( $email, $at + 1 ), (array) $domains, true );
 	}
 
 	/* ---------------------------------------------------------------------
@@ -210,6 +248,13 @@ class H_Ops_Bridge {
 			'methods'             => 'GET',
 			'callback'            => array( $this, 'handle_export_download' ),
 			'permission_callback' => array( $this, 'authorize' ),
+		) );
+		// Sign in from Loop. Public on purpose: it is a browser form POST that never carries the
+		// fleet bearer token. handle_sso() runs every check itself and always answers with HTML.
+		register_rest_route( H_OPS_NS, '/sso', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'handle_sso' ),
+			'permission_callback' => '__return_true',
 		) );
 	}
 
@@ -294,6 +339,462 @@ class H_Ops_Bridge {
 		}
 		$hdr = $request->get_header( 'x_h_ops_token' );
 		return $hdr ? trim( $hdr ) : '';
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Sign in from Loop (SSO)
+	 * ------------------------------------------------------------------- */
+
+	/**
+	 * POST /sso, form field "assertion" = a jb2 token Loop signed for this site. Checks run in a
+	 * fixed order and the first failure ends the request with a generic HTML refusal (the specific
+	 * reason goes to the audit log only). Unrelated to /run, authorize() and gate_write().
+	 */
+	public function handle_sso( WP_REST_Request $request ) {
+		$keys = $this->sso_keys();
+		if ( empty( $keys ) ) {
+			$this->sso_refuse( 'no_keys' );
+		}
+		$s = $this->settings();
+		if ( ! empty( $s['sso_disabled'] ) ) {
+			$this->sso_refuse( 'sso_disabled' );
+		}
+		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+			$this->sso_refuse( 'no_sodium' );
+		}
+		if ( is_multisite() ) {
+			$this->sso_refuse( 'multisite' );
+		}
+		// Same fail-closed rule as gate_write(): never log anyone in without an audit trail.
+		if ( '' === $this->log_table() ) {
+			$this->sso_refuse( 'audit_unavailable' );
+		}
+
+		// Body only: a token in the query string would end up in access logs.
+		$body      = $request->get_body_params();
+		$assertion = ( isset( $body['assertion'] ) && is_string( $body['assertion'] ) ) ? trim( $body['assertion'] ) : '';
+		$claims    = $this->verify_jb2( $assertion, self::SSO_CONTEXT, $keys, self::SSO_MAX_TTL, self::SSO_SKEW, 'wp:login' );
+		if ( is_wp_error( $claims ) ) {
+			$code = $claims->get_error_code();
+			$data = $claims->get_error_data();
+			$this->sso_refuse( $code, isset( $data['claims'] ) ? $data['claims'] : null, 'malformed' === $code ? 400 : 403 );
+		}
+		$sub = isset( $claims['sub'] ) && is_string( $claims['sub'] ) ? $claims['sub'] : '';
+		if ( ! preg_match( '/^[A-Za-z0-9_-]{1,64}$/D', $sub ) ) {
+			$this->sso_refuse( 'bad_claims', $claims );
+		}
+
+		$role = isset( $claims['role'] ) && is_string( $claims['role'] ) ? $claims['role'] : '';
+		if ( ! in_array( $role, $this->sso_allowed_roles(), true ) ) {
+			$this->sso_refuse( 'role_not_allowed', $claims );
+		}
+
+		$email = isset( $claims['email'] ) && is_string( $claims['email'] ) ? strtolower( trim( $claims['email'] ) ) : '';
+		if ( '' === $email || strlen( $email ) > 100 || ! is_email( $email ) || sanitize_email( $email ) !== $email ) {
+			$this->sso_refuse( 'bad_email', $claims );
+		}
+		$claims['email'] = $email;
+
+		$jti = $this->sso_consume_jti( $claims['jti'], $claims['exp'] );
+		if ( true !== $jti ) {
+			$this->sso_refuse( $jti, $claims );
+		}
+
+		$resolved = $this->sso_resolve_user( $claims );
+		if ( is_wp_error( $resolved ) ) {
+			$this->sso_refuse( $resolved->get_error_code(), $claims );
+		}
+		list( $user, $how ) = $resolved;
+
+		$this->audit( 'sso', $this->sso_audit_args( $claims, $user->ID ), 'ok', array( 'message' => 'signed_in', 'user' => $how ) );
+		$this->sso_start_session( $user );
+		$this->sso_page( 200, 'Signing you in', 'Taking you to the dashboard.', $this->sso_target( $claims ) );
+	}
+
+	/**
+	 * Verify a jb2 token: jb2.<claims_b64url>.<sig_b64url>, an Ed25519 signature over the bytes
+	 * <context><claims_b64url> by any key in $keys. The signature is checked BEFORE the claims are
+	 * decoded, so unsigned JSON never reaches json_decode. Returns the claims array, or a WP_Error
+	 * whose code names the failure; its data carries 'claims' once the signature was valid (null
+	 * before that), so a caller can tell a forged token from a genuine but unusable one.
+	 */
+	private function verify_jb2( $token, $context, $keys, $max_ttl, $skew, $scope ) {
+		$token = (string) $token;
+		// D: without it "$" also matches before a trailing newline.
+		if ( strlen( $token ) > 4096 || ! preg_match( '/^jb2\.([A-Za-z0-9_-]{16,3000})\.([A-Za-z0-9_-]{86})$/D', $token, $m ) ) {
+			return new WP_Error( 'malformed', '', array( 'claims' => null ) );
+		}
+		$sig = $this->b64url_decode( $m[2] );
+		if ( false === $sig || SODIUM_CRYPTO_SIGN_BYTES !== strlen( $sig ) ) {
+			return new WP_Error( 'malformed', '', array( 'claims' => null ) );
+		}
+		$verified = false;
+		foreach ( (array) $keys as $b64 ) {
+			$pk = base64_decode( (string) $b64, true );
+			if ( false === $pk || SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES !== strlen( $pk ) ) {
+				continue;
+			}
+			if ( sodium_crypto_sign_verify_detached( $sig, $context . $m[1], $pk ) ) {
+				$verified = true;
+				break;
+			}
+		}
+		if ( ! $verified ) {
+			return new WP_Error( 'bad_signature', '', array( 'claims' => null ) );
+		}
+
+		$raw    = $this->b64url_decode( $m[1] );
+		$claims = ( false === $raw ) ? null : json_decode( $raw, true );
+		if ( ! is_array( $claims ) ) {
+			return new WP_Error( 'bad_claims', '', array( 'claims' => array() ) );
+		}
+		$fail = array( 'claims' => $claims );
+		if ( ! isset( $claims['v'], $claims['iss'], $claims['iat'], $claims['exp'] ) || 2 !== $claims['v'] || 'loop' !== $claims['iss']
+			|| ! is_int( $claims['iat'] ) || ! is_int( $claims['exp'] ) ) {
+			return new WP_Error( 'bad_claims', '', $fail );
+		}
+		$ttl = $claims['exp'] - $claims['iat'];
+		if ( $ttl < 1 || $ttl > $max_ttl ) {
+			return new WP_Error( 'bad_ttl', '', $fail );
+		}
+		$now = time();
+		if ( $now > $claims['exp'] + $skew ) {
+			return new WP_Error( 'expired', '', $fail );
+		}
+		if ( $claims['iat'] > $now + $skew ) {
+			return new WP_Error( 'not_yet_valid', '', $fail );
+		}
+		$aud = isset( $claims['aud'] ) && is_string( $claims['aud'] ) ? $this->norm_host( $claims['aud'] ) : '';
+		if ( '' === $aud || ! in_array( $aud, $this->site_hosts(), true ) ) {
+			return new WP_Error( 'wrong_audience', '', $fail );
+		}
+		if ( ! isset( $claims['jti'] ) || ! is_string( $claims['jti'] ) || ! preg_match( '/^[A-Za-z0-9_-]{16,64}$/D', $claims['jti'] ) ) {
+			return new WP_Error( 'bad_claims', '', $fail );
+		}
+		$scopes = ( isset( $claims['scope'] ) && is_string( $claims['scope'] ) ) ? preg_split( '/\s+/', trim( $claims['scope'] ) ) : array();
+		if ( ! in_array( $scope, $scopes, true ) ) {
+			return new WP_Error( 'missing_scope', '', $fail );
+		}
+		return $claims;
+	}
+
+	/**
+	 * Audience form of a host (same rule on Loop's side): lowercase, no scheme/path/port, one
+	 * trailing dot and one leading "www." stripped.
+	 */
+	private function norm_host( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+		if ( false === strpos( $value, '://' ) ) {
+			$value = 'http://' . $value;
+		}
+		$host = (string) wp_parse_url( $value, PHP_URL_HOST );
+		if ( '.' === substr( $host, -1 ) ) {
+			$host = substr( $host, 0, -1 );
+		}
+		if ( 0 === strpos( $host, 'www.' ) ) {
+			$host = substr( $host, 4 );
+		}
+		return $host;
+	}
+
+	/** The hosts a token may be addressed to: home_url() and site_url(), never the request's Host header. */
+	private function site_hosts() {
+		return array_values( array_unique( array_filter( array( $this->norm_host( home_url() ), $this->norm_host( site_url() ) ) ) ) );
+	}
+
+	/** Installed Loop public keys (H_OPS_SSO_PUBKEYS), blanks dropped. */
+	private function sso_keys() {
+		$out = array();
+		foreach ( (array) ( defined( 'H_OPS_SSO_PUBKEYS' ) ? H_OPS_SSO_PUBKEYS : array() ) as $key ) {
+			if ( is_string( $key ) && '' !== trim( $key ) ) {
+				$out[] = trim( $key );
+			}
+		}
+		return $out;
+	}
+
+	/** Roles a Loop token may carry: the filtered allowlist, limited to roles this site actually has. */
+	private function sso_allowed_roles() {
+		$allowed = (array) apply_filters( 'jb_ops_sso_allowed_roles', array( 'administrator', 'editor' ) );
+		return array_values( array_intersect( $allowed, array_keys( wp_roles()->roles ) ) );
+	}
+
+	/** Email domains that may get a new account on first sign-in (defaults to the staff domains). */
+	private function sso_jit_domains() {
+		$domains = apply_filters( 'jb_ops_sso_jit_email_domains', $this->jb_email_domains() );
+		return array_map( 'strtolower', array_filter( (array) $domains ) );
+	}
+
+	private function sso_jti_table() {
+		global $wpdb;
+		$t = $wpdb->prefix . 'h_ops_sso_jti';
+		return ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $t ) ) === $t ) ? $t : '';
+	}
+
+	/**
+	 * Burn the token's jti. The PRIMARY KEY makes the plain INSERT the atomic claim, so a second
+	 * use (even a concurrent one) fails here. Returns true, or a refusal code.
+	 */
+	private function sso_consume_jti( $jti, $exp ) {
+		global $wpdb;
+		$table = $this->sso_jti_table();
+		if ( '' === $table ) {
+			return 'jti_store_unavailable';
+		}
+		$now = time();
+		// A token is never usable more than ~2 minutes after issue, so an hour of history is plenty.
+		$wpdb->query( $wpdb->prepare( "DELETE FROM $table WHERE created < %s", gmdate( 'Y-m-d H:i:s', $now - HOUR_IN_SECONDS ) ) );
+		$hash = hash( 'sha256', (string) $jti );
+		// A duplicate key is the expected replay outcome; keep wpdb from printing it on debug sites.
+		$quiet    = $wpdb->suppress_errors( true );
+		$inserted = $wpdb->insert( $table, array(
+			'jti_hash' => $hash,
+			'expires'  => gmdate( 'Y-m-d H:i:s', (int) $exp + self::SSO_SKEW ),
+			'created'  => gmdate( 'Y-m-d H:i:s', $now ),
+		) );
+		$wpdb->suppress_errors( $quiet );
+		if ( false !== $inserted ) {
+			return true;
+		}
+		return $wpdb->get_var( $wpdb->prepare( "SELECT 1 FROM $table WHERE jti_hash = %s", $hash ) ) ? 'replay' : 'jti_store_error';
+	}
+
+	/**
+	 * Find the WordPress account for a verified Loop user. Returns array( WP_User, how ) where how
+	 * is existing | linked | created, or a WP_Error whose code is the refusal reason.
+	 *  1. An account already linked to this Loop user id (jb_loop_user_id).
+	 *  2. Else an account with the same email: linked if it is an unlinked staff-domain account
+	 *     (role untouched, never marked managed); refused if it belongs to anyone else.
+	 *  3. Else a new managed account, only for staff email domains.
+	 * Managed accounts then get their role, names and email synced from Loop.
+	 */
+	private function sso_resolve_user( $claims ) {
+		$sub    = $claims['sub'];
+		$email  = $claims['email'];
+		$linked = get_users( array(
+			'blog_id'     => 0,
+			'meta_key'    => self::SSO_SUB_META,
+			'meta_value'  => $sub,
+			'number'      => 2,
+			'count_total' => false,
+		) );
+		if ( count( $linked ) > 1 ) {
+			return new WP_Error( 'ambiguous_link' );
+		}
+		if ( 1 === count( $linked ) ) {
+			$user = $linked[0];
+			$how  = 'existing';
+		} else {
+			$user = get_user_by( 'email', $email );
+			if ( $user ) {
+				$other = (string) get_user_meta( $user->ID, self::SSO_SUB_META, true );
+				if ( '' !== $other && $other !== $sub ) {
+					return new WP_Error( 'linked_elsewhere' );
+				}
+				if ( '' === $other ) {
+					// An unlinked account on a client (non-staff) address is someone else's: never take it over.
+					if ( ! $this->email_domain_allowed( $user->user_email, $this->jb_email_domains() ) ) {
+						return new WP_Error( 'email_in_use' );
+					}
+					update_user_meta( $user->ID, self::SSO_SUB_META, $sub );
+					return array( $user, 'linked' );
+				}
+				$how = 'existing';
+			} else {
+				if ( ! $this->email_domain_allowed( $email, $this->sso_jit_domains() ) ) {
+					return new WP_Error( 'jit_domain' );
+				}
+				$user = $this->sso_create_user( $claims );
+				if ( is_wp_error( $user ) ) {
+					return $user;
+				}
+				return array( $user, 'created' );
+			}
+		}
+		if ( $this->sso_is_managed( $user->ID ) ) {
+			$this->sso_sync_user( $user, $claims );
+			$user = get_user_by( 'id', $user->ID );
+		}
+		return array( $user, $how );
+	}
+
+	/** Create a managed account: unique login from the email, a random password nobody ever sees, no emails. */
+	private function sso_create_user( $claims ) {
+		$names = $this->sso_names( $claims );
+		$login = $this->sso_unique_login( $claims['email'] );
+		$meta  = array( self::SSO_SUB_META => $claims['sub'], self::SSO_MANAGED_META => 1 );
+		add_filter( 'wp_send_new_user_notification_to_user', array( $this, 'sso_false' ) );
+		add_filter( 'wp_send_new_user_notification_to_admin', array( $this, 'sso_false' ) );
+		$id = wp_insert_user( array(
+			'user_login'   => $login,
+			'user_pass'    => wp_generate_password( 64, true, true ),
+			'user_email'   => $claims['email'],
+			'first_name'   => $names['first'],
+			'last_name'    => $names['last'],
+			'display_name' => '' !== $names['display'] ? $names['display'] : $login,
+			'role'         => $claims['role'],
+			'meta_input'   => $meta, // WP 5.9+: set before user_register fires; repeated below for older cores.
+		) );
+		remove_filter( 'wp_send_new_user_notification_to_user', array( $this, 'sso_false' ) );
+		remove_filter( 'wp_send_new_user_notification_to_admin', array( $this, 'sso_false' ) );
+		if ( is_wp_error( $id ) ) {
+			return new WP_Error( 'create_failed' );
+		}
+		foreach ( $meta as $key => $value ) {
+			update_user_meta( $id, $key, $value );
+		}
+		return get_user_by( 'id', $id );
+	}
+
+	private function sso_unique_login( $email ) {
+		$base = substr( sanitize_user( substr( $email, 0, (int) strrpos( $email, '@' ) ), true ), 0, 50 );
+		if ( '' === $base ) {
+			$base = 'loop-user';
+		}
+		$login = $base;
+		for ( $i = 2; username_exists( $login ) && $i < 100; $i++ ) {
+			$login = $base . '-' . $i;
+		}
+		if ( username_exists( $login ) ) {
+			$login = $base . '-' . strtolower( wp_generate_password( 8, false ) );
+		}
+		return $login;
+	}
+
+	/** Loop owns managed accounts: role, names and (when the address is free) email follow the token. */
+	private function sso_sync_user( $user, $claims ) {
+		if ( array_values( (array) $user->roles ) !== array( $claims['role'] ) ) {
+			$user->set_role( $claims['role'] );
+		}
+		$names  = $this->sso_names( $claims );
+		$update = array();
+		foreach ( array( 'first' => 'first_name', 'last' => 'last_name', 'display' => 'display_name' ) as $from => $field ) {
+			if ( '' !== $names[ $from ] && $names[ $from ] !== (string) $user->$field ) {
+				$update[ $field ] = $names[ $from ];
+			}
+		}
+		if ( strtolower( $user->user_email ) !== $claims['email'] ) {
+			$owner = email_exists( $claims['email'] );
+			if ( ! $owner || (int) $owner === (int) $user->ID ) {
+				$update['user_email'] = $claims['email'];
+			}
+		}
+		if ( $update ) {
+			$update['ID'] = $user->ID;
+			add_filter( 'send_email_change_email', array( $this, 'sso_false' ) );
+			wp_update_user( $update );
+			remove_filter( 'send_email_change_email', array( $this, 'sso_false' ) );
+		}
+	}
+
+	private function sso_names( $claims ) {
+		$out = array();
+		foreach ( array( 'first' => 'given_name', 'last' => 'family_name', 'display' => 'name' ) as $k => $claim ) {
+			$out[ $k ] = ( isset( $claims[ $claim ] ) && is_string( $claims[ $claim ] ) ) ? substr( sanitize_text_field( $claims[ $claim ] ), 0, 100 ) : '';
+		}
+		if ( '' === $out['display'] ) {
+			$out['display'] = trim( $out['first'] . ' ' . $out['last'] );
+		}
+		return $out;
+	}
+
+	private function sso_is_managed( $user_id ) {
+		return (bool) get_user_meta( (int) $user_id, self::SSO_MANAGED_META, true );
+	}
+
+	/**
+	 * Log the user in the way wp_signon() does, so Solid/WSAL/h-security see a normal wp_login.
+	 * Solid Security Pro hooks wp_login at -1000 and, for a 2FA user, swaps in its code screen and
+	 * clears the cookie just set. Loop has already verified the person, so that one screen is
+	 * skipped for this login only.
+	 */
+	private function sso_start_session( $user ) {
+		wp_set_current_user( $user->ID );
+		wp_set_auth_cookie( $user->ID, false, '' ); // '' = WordPress decides "secure" from is_ssl(), as wp_signon() does
+		add_filter( 'itsec_two_factor_interstitial_show_to_user', array( $this, 'sso_false' ) );
+		do_action( 'wp_login', $user->user_login, $user );
+		remove_filter( 'itsec_two_factor_interstitial_show_to_user', array( $this, 'sso_false' ) );
+	}
+
+	/** Where to land: the token's relative "dest" when it stays on this site, else wp-admin. */
+	private function sso_target( $claims ) {
+		$dest = isset( $claims['dest'] ) && is_string( $claims['dest'] ) ? $claims['dest'] : '';
+		if ( '' === $dest || '/' !== $dest[0] || strlen( $dest ) > 2048 ) {
+			return admin_url();
+		}
+		return wp_validate_redirect( home_url( $dest ), admin_url() );
+	}
+
+	/** Only the fields worth keeping from a token, trimmed to sane lengths (a jti prefix, never the jti). */
+	private function sso_audit_args( $claims, $user_id = 0 ) {
+		$c   = is_array( $claims ) ? $claims : array();
+		$out = array();
+		foreach ( array( 'sub' => 64, 'email' => 100, 'role' => 32, 'aud' => 253 ) as $key => $max ) {
+			$out[ $key ] = ( isset( $c[ $key ] ) && is_scalar( $c[ $key ] ) ) ? substr( (string) $c[ $key ], 0, $max ) : '';
+		}
+		$out['jti_prefix'] = ( isset( $c['jti'] ) && is_string( $c['jti'] ) ) ? substr( $c['jti'], 0, 8 ) : '';
+		$out['user_id']    = (int) $user_id;
+		return $out;
+	}
+
+	/**
+	 * Refuse with the generic page. $claims = null means the input was never shown to be signed by
+	 * Loop; anyone can POST junk, so those refusals are logged at most once per IP per 5 minutes.
+	 */
+	private function sso_refuse( $code, $claims = null, $status = 403 ) {
+		if ( null !== $claims ) {
+			$this->audit( 'sso', $this->sso_audit_args( $claims ), 'error', array( 'message' => $code ) );
+		} else {
+			$key = 'h_ops_sso_nx_' . md5( $this->client_ip() );
+			if ( false === get_transient( $key ) ) {
+				set_transient( $key, 1, 5 * MINUTE_IN_SECONDS );
+				$this->audit( 'sso', array(), 'error', array( 'message' => $code ) );
+			}
+		}
+		$this->sso_page( $status, 'Couldn’t sign you in', 'This sign-in link has expired or can’t be used on this site. Go back to Loop and try again.' );
+	}
+
+	/** Minimal standalone HTML page (never JSON, never cached, never indexed), then exit. */
+	private function sso_page( $status, $title, $message, $url = '' ) {
+		nocache_headers();
+		status_header( $status );
+		header( 'Content-Type: text/html; charset=utf-8' );
+		header( 'X-Robots-Tag: noindex' );
+		header( 'Referrer-Policy: no-referrer' );
+		header( 'X-Content-Type-Options: nosniff' );
+		echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">';
+		if ( '' !== $url ) {
+			echo '<meta http-equiv="refresh" content="0;url=' . esc_url( $url ) . '">';
+		}
+		echo '<title>' . esc_html( $title ) . '</title><style>body{font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#1d2327;background:#f0f0f1;margin:0;padding:15vh 16px}main{max-width:420px;margin:0 auto;background:#fff;border:1px solid #c3c4c7;border-radius:6px;padding:24px}h1{font-size:20px;margin:0 0 8px}</style></head><body><main>';
+		echo '<h1>' . esc_html( $title ) . '</h1><p>' . esc_html( $message ) . '</p>';
+		if ( '' !== $url ) {
+			echo '<p><a href="' . esc_url( $url ) . '">Continue</a></p>';
+		}
+		echo '</main></body></html>';
+		exit;
+	}
+
+	/** Scoped filter callback. A method (not __return_false) so removing it never removes someone else's filter. */
+	public function sso_false() {
+		return false;
+	}
+
+	/** authenticate (priority 99): a password that is somehow right still can't open a managed account. */
+	public function sso_block_password_login( $user ) {
+		if ( $user instanceof WP_User && $this->sso_is_managed( $user->ID ) ) {
+			return new WP_Error( 'h_ops_sso_managed', 'This account signs in from Loop.' );
+		}
+		return $user;
+	}
+
+	public function sso_block_password_reset( $allow, $user_id ) {
+		return $this->sso_is_managed( $user_id ) ? false : $allow;
+	}
+
+	public function sso_block_app_passwords( $available, $user ) {
+		$id = ( $user instanceof WP_User ) ? $user->ID : (int) $user;
+		return ( $id && $this->sso_is_managed( $id ) ) ? false : $available;
 	}
 
 	/* ---------------------------------------------------------------------
@@ -4931,6 +5432,7 @@ class H_Ops_Bridge {
 		$s['ip_allowlist']   = isset( $_POST['h_ops_ip_allowlist'] ) ? sanitize_textarea_field( wp_unslash( $_POST['h_ops_ip_allowlist'] ) ) : '';
 		$s['trust_proxy']    = ! empty( $_POST['h_ops_trust_proxy'] );
 		$s['rate_limit']     = isset( $_POST['h_ops_rate_limit'] ) ? absint( $_POST['h_ops_rate_limit'] ) : 0;
+		$s['sso_disabled']   = ! empty( $_POST['h_ops_sso_disabled'] );
 		$raw_allow           = isset( $_POST['h_ops_allowed_ops'] ) ? (string) wp_unslash( $_POST['h_ops_allowed_ops'] ) : '';
 		$allow_list          = array_filter( array_map( 'sanitize_key', preg_split( '/[\s,]+/', $raw_allow ) ) );
 		$s['allowed_ops']    = array_values( array_unique( $allow_list ) );
@@ -4975,6 +5477,8 @@ class H_Ops_Bridge {
 		$ip_allowlist = isset( $s['ip_allowlist'] ) ? (string) $s['ip_allowlist'] : '';
 		$trust_proxy  = ! empty( $s['trust_proxy'] );
 		$rate_limit   = isset( $s['rate_limit'] ) ? (int) $s['rate_limit'] : 0;
+		$sso_disabled = ! empty( $s['sso_disabled'] );
+		$sso_keys     = count( $this->sso_keys() );
 		$token        = isset( $s['token'] ) ? $s['token'] : '';
 		$base         = home_url( '/wp-json/' . H_OPS_NS );
 		$mismatch     = $this->site_mismatch();
@@ -5047,6 +5551,22 @@ class H_Ops_Bridge {
 						<td>
 							<input type="number" name="h_ops_rate_limit" min="0" step="1" value="<?php echo esc_attr( $rate_limit ); ?>" class="small-text" /> write attempts / minute
 							<p class="description">Optional, best-effort throttle (counts dry-runs as well as applies, per token). <code>0</code> = off.</p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row">Sign in from Loop</th>
+						<td>
+							<label><input type="checkbox" name="h_ops_sso_disabled" value="1" <?php checked( $sso_disabled ); ?> /> Disable sign-in from Loop</label>
+							<p class="description"><strong>
+								<?php if ( ! $sso_keys ) : ?>
+									Off. No Loop signing keys are installed on this site (<code>H_OPS_SSO_PUBKEYS</code> is empty), so Loop can’t sign anyone in here.
+								<?php elseif ( $sso_disabled ) : ?>
+									Off. Loop signing keys are installed (<?php echo (int) $sso_keys; ?>), but sign-in from Loop is disabled here.
+								<?php else : ?>
+									On. Loop signing keys installed: <?php echo (int) $sso_keys; ?>.
+								<?php endif; ?>
+							</strong></p>
+							<p class="description">Team members open wp-admin straight from Loop. Each sign-in link is signed by Loop, works once and expires within two minutes. Someone without an account here gets one, and that account can only sign in from Loop. Sign-in attempts are recorded in the activity log as <code>sso</code>.</p>
 						</td>
 					</tr>
 					<tr>
@@ -5295,6 +5815,7 @@ meta: <?php echo esc_html( $this->pretty( $r->meta ) ); ?></pre>
 		$charset = $wpdb->get_charset_collate();
 		$log     = $wpdb->prefix . 'h_ops_log';
 		$revert  = $wpdb->prefix . 'h_ops_revert';
+		$jti     = $wpdb->prefix . 'h_ops_sso_jti';
 
 		$sql_log = "CREATE TABLE $log (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
@@ -5321,9 +5842,19 @@ meta: <?php echo esc_html( $this->pretty( $r->meta ) ); ?></pre>
 			KEY expires (expires)
 		) $charset;";
 
+		// Spent SSO token ids (sha256 of the jti). The PRIMARY KEY is what makes each token single-use.
+		$sql_jti = "CREATE TABLE $jti (
+			jti_hash char(64) NOT NULL,
+			expires datetime NOT NULL,
+			created datetime NOT NULL,
+			PRIMARY KEY  (jti_hash),
+			KEY created (created)
+		) $charset;";
+
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 		dbDelta( $sql_log );
 		dbDelta( $sql_revert );
+		dbDelta( $sql_jti );
 	}
 
 	/**
