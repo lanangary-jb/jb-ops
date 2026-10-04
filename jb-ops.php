@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Ops Bridge
  * Description: JuiceBox Ops Bridge — a secured, structured REST endpoint for AI-assisted site/DB inspection and controlled changes. Reads and writes are allowlisted ops; writes are dry-run by default and need a confirm_token to apply, and each applied write returns a revert_token. The wp-admin UI is visible only to JuiceBox staff (logged-in admins on a juicebox.co.id / juicebox.com.au email).
- * Version: 0.12.0
+ * Version: 0.12.1
  * Author: JuiceBox
  *
  * SECURITY MODEL
@@ -52,7 +52,7 @@ if ( defined( 'H_OPS_VERSION' ) ) {
 	return;
 }
 
-define( 'H_OPS_VERSION', '0.12.0' );
+define( 'H_OPS_VERSION', '0.12.1' );
 define( 'H_OPS_NS', 'h-ops/v1' );
 
 /**
@@ -2391,7 +2391,9 @@ class H_Ops_Bridge {
 					if ( $do_sr ) {
 						$val = $this->sr_replace( $val, $from, $to );
 					}
-					$cells[] = "'" . $wpdb->_real_escape( (string) $val ) . "'";
+					// _real_escape() swaps every % for $wpdb's placeholder hash, which only
+					// prepare()/query() swap back. Undo it, or the dump ships the hash instead of %.
+					$cells[] = "'" . $wpdb->remove_placeholder_escape( $wpdb->_real_escape( (string) $val ) ) . "'";
 				}
 				$tuples[] = '(' . implode( ',', $cells ) . ')';
 			}
