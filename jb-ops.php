@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Ops Bridge
  * Description: JuiceBox Ops Bridge — a secured, structured REST endpoint for AI-assisted site/DB inspection and controlled changes. Reads and writes are allowlisted ops; writes are dry-run by default and need a confirm_token to apply, and each applied write returns a revert_token. The wp-admin UI is visible only to JuiceBox staff (logged-in admins on a juicebox.co.id / juicebox.com.au email).
- * Version: 0.12.0
+ * Version: 0.13.0
  * Author: JuiceBox
  *
  * SECURITY MODEL
@@ -52,7 +52,7 @@ if ( defined( 'H_OPS_VERSION' ) ) {
 	return;
 }
 
-define( 'H_OPS_VERSION', '0.12.0' );
+define( 'H_OPS_VERSION', '0.13.0' );
 define( 'H_OPS_NS', 'h-ops/v1' );
 
 /**
@@ -1130,8 +1130,8 @@ class H_Ops_Bridge {
 				'desc' => 'Active theme, active plugins, multisite flag, permalink structure.',
 			),
 			'get_post' => array(
-				'type' => 'read', 'cb' => array( $this, 'op_get_post' ), 'args' => array( 'id*' ),
-				'desc' => 'Single post: core fields, permalink, parent, status.',
+				'type' => 'read', 'cb' => array( $this, 'op_get_post' ), 'args' => array( 'id*', 'include_content' ),
+				'desc' => 'Single post: core fields, permalink, parent, status. include_content=true adds the raw post_content (block markup, unrendered) plus its content_sha1 and content_bytes; pass that sha1 to replace_in_post_content as expected_sha1.',
 			),
 			'query_posts' => array(
 				'type' => 'read', 'cb' => array( $this, 'op_query_posts' ),
@@ -1226,7 +1226,12 @@ class H_Ops_Bridge {
 			'update_post_field' => array(
 				'type' => 'write', 'tier' => 'core', 'args' => array( 'id*', 'field*', 'value*' ),
 				'preview' => array( $this, 'pv_update_post_field' ), 'apply' => array( $this, 'ap_update_post_field' ),
-				'desc' => 'Update a whitelisted post field: post_status, post_name, post_parent, post_title, post_excerpt, post_content.',
+				'desc' => 'Update a whitelisted post field: post_status, post_name, post_parent, post_title, post_excerpt, post_content. The value runs through WordPress save filters (kses), so a whole post_content rewrite can drop markup such as iframes; to change part of the content use replace_in_post_content.',
+			),
+			'replace_in_post_content' => array(
+				'type' => 'write', 'tier' => 'core', 'args' => array( 'id*', 'replacements', 'search', 'replace', 'expected_count', 'expected_sha1' ),
+				'preview' => array( $this, 'pv_replace_in_post_content' ), 'apply' => array( $this, 'ap_replace_in_post_content' ),
+				'desc' => 'Swap exact strings inside a post\'s raw post_content and leave every other byte as stored (e.g. an image id inside ACF block JSON: search the text "background":2826). Pass "replacements" as [{search, replace, expected_count}, ...] applied in order, or a single search/replace/expected_count. Refused when a count does not match, when expected_sha1 (from get_post include_content) no longer matches, or when the result would hold markup WordPress\'s HTML filter strips (scripts, event handlers, JSON-escaped tags). Dry-run shows each match in context. Revert restores the exact prior content.',
 			),
 			'create_post' => array(
 				'type' => 'write', 'tier' => 'core', 'args' => array( 'post_title*', 'post_type', 'post_status', 'post_content', 'post_excerpt', 'post_name', 'post_parent', 'post_author' ),
@@ -1548,7 +1553,7 @@ class H_Ops_Bridge {
 		if ( ! $p ) {
 			return array( 'found' => false, 'id' => $id );
 		}
-		return array(
+		$out = array(
 			'found'       => true,
 			'id'          => $p->ID,
 			'title'       => $p->post_title,
@@ -1560,6 +1565,14 @@ class H_Ops_Bridge {
 			'modified'    => $p->post_modified,
 			'old_slugs'   => get_post_meta( $p->ID, '_wp_old_slug' ),
 		);
+		// Returned whole and unredacted: callers edit it and write it back, so a truncated or
+		// redacted copy would be written back as damage. update_post_field's dry run already shows it.
+		if ( $this->truthy( $args['include_content'] ?? false ) ) {
+			$out['content']       = (string) $p->post_content;
+			$out['content_sha1']  = sha1( (string) $p->post_content );
+			$out['content_bytes'] = strlen( (string) $p->post_content );
+		}
+		return $out;
 	}
 
 	public function op_query_posts( $args ) {
@@ -2717,11 +2730,129 @@ class H_Ops_Bridge {
 		if ( ! in_array( $field, $this->post_field_whitelist, true ) ) {
 			throw new Exception( 'field not allowed' );
 		}
-		$res = wp_update_post( array( 'ID' => $id, $field => $args['value'] ?? '' ), true );
+		// wp_update_post() unslashes its input: unslashed, every backslash in block JSON is lost.
+		$res = wp_update_post( wp_slash( array( 'ID' => $id, $field => $args['value'] ?? '' ) ), true );
 		if ( is_wp_error( $res ) ) {
 			throw new Exception( $res->get_error_message() );
 		}
 		return true;
+	}
+
+	/** Normalise replace_in_post_content args to a list of {search, replace, expected_count}. */
+	private function content_replacements( $args ) {
+		$list = isset( $args['replacements'] )
+			? $args['replacements']
+			: array( array( 'search' => $args['search'] ?? '', 'replace' => $args['replace'] ?? null, 'expected_count' => $args['expected_count'] ?? null ) );
+		if ( ! is_array( $list ) || empty( $list ) || count( $list ) > 50 ) {
+			throw new Exception( 'replacements must be an array of 1-50 {search, replace, expected_count}' );
+		}
+		$out = array();
+		foreach ( array_values( $list ) as $i => $r ) {
+			if ( ! is_array( $r ) || ! isset( $r['search'] ) || ! is_scalar( $r['search'] ) || '' === (string) $r['search'] ) {
+				throw new Exception( "replacement $i: search is required" );
+			}
+			if ( ! isset( $r['replace'] ) || ! is_scalar( $r['replace'] ) ) {
+				throw new Exception( "replacement $i: replace is required" );
+			}
+			if ( ! isset( $r['expected_count'] ) || ! is_numeric( $r['expected_count'] ) || (int) $r['expected_count'] < 1 ) {
+				throw new Exception( "replacement $i: expected_count (1 or more) is required" );
+			}
+			$out[] = array( 'search' => (string) $r['search'], 'replace' => (string) $r['replace'], 'expected_count' => (int) $r['expected_count'] );
+		}
+		return $out;
+	}
+
+	/** Each match of $search with ~60 bytes either side, before and after the swap (first 20). */
+	private function match_contexts( $haystack, $search, $replace ) {
+		$cut = function ( $s, $start, $len ) {
+			return function_exists( 'mb_strcut' ) ? mb_strcut( $s, $start, $len, 'UTF-8' ) : substr( $s, $start, $len );
+		};
+		$out = array();
+		$pos = 0;
+		while ( count( $out ) < 20 && false !== ( $at = strpos( $haystack, $search, $pos ) ) ) {
+			$start = max( 0, $at - 60 );
+			$lead  = $cut( $haystack, $start, $at - $start );
+			$tail  = $cut( $haystack, $at + strlen( $search ), 60 );
+			$out[] = array( 'offset' => $at, 'before' => $lead . $search . $tail, 'after' => $lead . $replace . $tail );
+			$pos   = $at + strlen( $search );
+		}
+		return $out;
+	}
+
+	public function pv_replace_in_post_content( $args ) {
+		$id     = $this->require_post( $args );
+		$before = (string) get_post( $id )->post_content;
+		if ( ! empty( $args['expected_sha1'] ) && ! hash_equals( sha1( $before ), strtolower( (string) $args['expected_sha1'] ) ) ) {
+			throw new Exception( 'expected_sha1 does not match: the content changed since it was read. Read it again with get_post include_content.' );
+		}
+		$reps    = $this->content_replacements( $args );
+		$after   = $before;
+		$matches = array();
+		foreach ( $reps as $i => $r ) {
+			$found = substr_count( $after, $r['search'] );
+			if ( $found !== $r['expected_count'] ) {
+				throw new Exception( sprintf( 'replacement %d: found %d match(es), expected %d. Make the search string more specific.', $i, $found, $r['expected_count'] ) );
+			}
+			$matches[] = array( 'search' => $r['search'], 'replace' => $r['replace'], 'count' => $found, 'context' => $this->match_contexts( $after, $r['search'], $r['replace'] ) );
+			$after     = str_replace( $r['search'], $r['replace'], $after );
+		}
+		$this->assert_kses_neutral( $before, $after, $reps );
+		return array(
+			'before'       => array( 'content_sha1' => sha1( $before ), 'content_bytes' => strlen( $before ) ),
+			'after'        => array( 'content_sha1' => sha1( $after ), 'content_bytes' => strlen( $after ), 'matches' => $matches ),
+			'would_change' => $before !== $after,
+			'summary'      => sprintf( 'post %d post_content: %d replacement(s)', $id, count( $reps ) ),
+			'revert'       => array( 'type' => 'post_field', 'id' => $id, 'field' => 'post_content', 'value' => $before ),
+			'_content'     => $after, // not in public_diff; apply writes exactly this
+		);
+	}
+	public function ap_replace_in_post_content( $args, $preview ) {
+		$id = absint( $args['id'] );
+		$this->write_post_exact( array( 'ID' => $id, 'post_content' => $preview['_content'] ) );
+		clean_post_cache( $id );
+		$stored = (string) get_post( $id )->post_content;
+		// Report, don't throw: the write has landed, and throwing would withhold the revert_token.
+		return array( 'content_sha1' => sha1( $stored ), 'stored_exact' => $stored === $preview['_content'] );
+	}
+
+	/**
+	 * The swap is written with kses off (see write_post_exact), so check here that it adds nothing
+	 * kses would strip. Every match must survive kses on the old content (a match inside a tag kses
+	 * drops, e.g. an iframe, could otherwise smuggle an attribute in), and kses on the new content
+	 * must equal kses on the old content with the same swaps.
+	 */
+	private function assert_kses_neutral( $before, $after, $reps ) {
+		$filtered = wp_kses_post( $before );
+		foreach ( $reps as $i => $r ) {
+			if ( substr_count( $filtered, $r['search'] ) !== $r['expected_count'] ) {
+				throw new Exception( sprintf( 'replacement %d: refused, part of the match sits in markup WordPress\'s HTML filter rewrites or strips (an iframe, an event handler, or a JSON escape such as \\/ or a bare &). Search a shorter piece without it.', $i ) );
+			}
+			$filtered = str_replace( $r['search'], $r['replace'], $filtered );
+		}
+		if ( wp_kses_post( $after ) !== $filtered ) {
+			throw new Exception( 'refused: the replacement adds markup WordPress\'s HTML filter would strip or change (a script, an event handler, an escaped tag, or a bare &).' );
+		}
+	}
+
+	/**
+	 * wp_update_post() that stores the values byte for byte: slashed (it unslashes its input) and with
+	 * kses unhooked (a token request has no user, so kses would rewrite markup an admin saved, like
+	 * iframes). Only for values already vetted (assert_kses_neutral) or restored from a revert payload.
+	 */
+	private function write_post_exact( $postarr ) {
+		$kses = false !== has_filter( 'content_save_pre', 'wp_filter_post_kses' );
+		kses_remove_filters();
+		try {
+			$res = wp_update_post( wp_slash( $postarr ), true );
+		} finally {
+			if ( $kses ) {
+				kses_init_filters();
+			}
+		}
+		if ( is_wp_error( $res ) ) {
+			throw new Exception( $res->get_error_message() );
+		}
+		return $res;
 	}
 
 	/** Statuses an AI is allowed to create a post in. */
@@ -4018,7 +4149,7 @@ class H_Ops_Bridge {
 	}
 	public function ap_create_synced_block( $args, $preview ) {
 		$a  = $preview['after'];
-		$id = wp_insert_post( array( 'post_type' => 'wp_block', 'post_status' => 'publish', 'post_title' => $a['title'], 'post_content' => $a['content'] ), true );
+		$id = wp_insert_post( wp_slash( array( 'post_type' => 'wp_block', 'post_status' => 'publish', 'post_title' => $a['title'], 'post_content' => $a['content'] ) ), true );
 		if ( is_wp_error( $id ) ) {
 			throw new Exception( $id->get_error_message() );
 		}
@@ -4969,9 +5100,11 @@ class H_Ops_Bridge {
 				}
 				break;
 			case 'post_field':
-				$res = wp_update_post( array( 'ID' => $p['id'], $p['field'] => $p['value'] ), true );
-				if ( is_wp_error( $res ) ) {
-					throw new Exception( 'post_field revert failed: ' . $res->get_error_message() );
+				// Byte-exact: the value is what was stored before, so kses must not rewrite it on the way back.
+				try {
+					$this->write_post_exact( array( 'ID' => $p['id'], $p['field'] => $p['value'] ) );
+				} catch ( Exception $e ) {
+					throw new Exception( 'post_field revert failed: ' . $e->getMessage() );
 				}
 				break;
 			case 'permalink':
